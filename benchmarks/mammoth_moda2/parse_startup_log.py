@@ -20,6 +20,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime
 from typing import Any
 
 STAGE = r"\(StageEngineCoreProc_stage(?P<stage>\d+)_replica\d+ pid=\d+\)"
@@ -59,9 +60,9 @@ MILESTONES = [
 
 
 def _ts_seconds(ts: str) -> int:
-    _, hms = ts.split(" ")
-    h, m, s = (int(x) for x in hms.split(":"))
-    return h * 3600 + m * 60 + s
+    # Use a leap year because engine timestamps do not include the year.
+    value = datetime.strptime("2000-" + ts, "%Y-%m-%d %H:%M:%S")
+    return int((value - datetime(2000, 1, 1)).total_seconds())
 
 
 def timeline(lines: list[str]) -> dict:
@@ -80,7 +81,7 @@ def timeline(lines: list[str]) -> dict:
     if "omni_init_start" not in marks:
         return {}
     t0 = marks["omni_init_start"]
-    rel = {k: v - t0 for k, v in marks.items()}
+    rel = {k: (v - t0) % (366 * 86400) for k, v in marks.items()}
     phases: dict[str, Any] = {}
     names = ("launch", "proc_up", "load_start", "load_done", "init_done", "ready")
     for s in sorted({k.split("_")[0] for k in rel if k.startswith("stage")}):
@@ -91,7 +92,7 @@ def timeline(lines: list[str]) -> dict:
         phases[s] = {
             "spawn_import_config_s": ts["proc_up"] - ts["launch"],
             "device_dist_init_s": ts["load_start"] - ts["proc_up"],
-            "weights_load_s": ts["load_done"] - ts["load_start"],
+            "model_and_weights_load_s": ts["load_done"] - ts["load_start"],
             "profile_kv_warmup_s": ts["init_done"] - ts["load_done"],
             "ready_handoff_s": ts["ready"] - ts["init_done"],
             "total_s": ts["ready"] - ts["launch"],
@@ -141,112 +142,83 @@ def parse(path: str) -> dict:
                 st["model_load_s"] = float(m.group("v"))
                 st["model_load_mem_gib"] = float(m.group("mem"))
                 # "Model loading took" covers model construction + weight loading; "Loading weights took" only
-                # the weights, so their difference is the model-construction (model_init) time.
+                # the weights. The difference also includes loader setup/teardown overhead.
                 if "weights_load_s" in st:
-                    st["model_init_s"] = round(st["model_load_s"] - st["weights_load_s"], 2)
+                    st["model_setup_estimate_s"] = round(st["model_load_s"] - st["weights_load_s"], 2)
             else:
                 st[key] = float(m.group("v"))
             break
+    rec["status"] = "complete" if "bench" in rec else "incomplete"
     return rec
 
 
+def _table(columns: dict[str, str], records: list[dict]) -> str:
+    def row(values):
+        return "| " + " | ".join("" if v is None else str(v) for v in values) + " |"
+
+    lines = [row(columns.values()), row(["---"] * len(columns))]
+    lines.extend(row(record.get(key) for key in columns) for record in records)
+    return "\n".join(lines)
+
+
 def to_markdown(recs: list[dict]) -> str:
-    rows = []
-    hdr = [
-        "label",
-        "model fs",
-        "stage",
-        "ckpt read (GiB)",
-        "model init (s)",
-        "weights load (s)",
-        "load mem (GiB)",
-        "compile (s)",
-        "graph capture (s)",
-        "engine init (s)",
-    ]
-    rows.append("| " + " | ".join(hdr) + " |")
-    rows.append("|" + "---|" * len(hdr))
+    summary, stages, phases, warnings = [], [], [], []
     for r in recs:
         b = r.get("bench", {})
         label = b.get("label", r["log"])
-        fs = b.get("model_fs", "?")
+        if r.get("status") == "incomplete":
+            warnings.append(f"Incomplete log: {r['log']} (no BENCH_JSON).")
+        summary.append({"label": label, **b.get("summary_s", {})})
         for sid, st in sorted(r["stages"].items()):
-            rows.append(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
-                    label,
-                    fs,
-                    sid,
-                    st.get("checkpoint_size_gib", ""),
-                    st.get("model_init_s", ""),
-                    st.get("weights_load_s", ""),
-                    st.get("model_load_mem_gib", ""),
-                    "unsupported" if st.get("torch_compile_unsupported") else st.get("compile_s", ""),
-                    st.get("graph_capture_s", ""),
-                    st.get("engine_init_s", ""),
-                )
-            )
-    rows.append("")
-    hdr2 = [
-        "label",
-        "imports (s)",
-        "engine ready (s)",
-        "first request (s)",
-        "steady request (s)",
-        "process→first image (s)",
-        "host RSS peak (GiB)",
-        "GPU used peak (GiB)",
-    ]
-    rows.append("| " + " | ".join(hdr2) + " |")
-    rows.append("|" + "---|" * len(hdr2))
-    for r in recs:
-        b = r.get("bench", {})
-        s = b.get("summary_s", {})
-        rows.append(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
-                b.get("label", r["log"]),
-                s.get("imports", ""),
-                s.get("engine_init", ""),
-                s.get("first_request", ""),
-                s.get("steady_request_avg", ""),
-                s.get("time_to_first_image_from_process_start", ""),
-                s.get("host_rss_peak_gib", ""),
-                s.get("gpu_used_peak_gib", ""),
-            )
-        )
-    rows.append("")
-    hdr3 = [
-        "label",
-        "stage",
-        "spawn+import (s)",
-        "device/dist init (s)",
-        "weights load (s)",
-        "profile/kv/warmup (s)",
-        "stage total (s)",
-    ]
-    rows.append("| " + " | ".join(hdr3) + " |")
-    rows.append("|" + "---|" * len(hdr3))
-    for r in recs:
-        b = r.get("bench", {})
-        ph = (r.get("timeline") or {}).get("phases", {})
-        for sid, p in sorted((k, v) for k, v in ph.items() if k.startswith("stage")):
-            rows.append(
-                "| {} | {} | {} | {} | {} | {} | {} |".format(
-                    b.get("label", r["log"]),
-                    sid,
-                    p["spawn_import_config_s"],
-                    p["device_dist_init_s"],
-                    p["weights_load_s"],
-                    p["profile_kv_warmup_s"],
-                    p["total_s"],
-                )
-            )
+            stages.append({"label": label, "stage": sid, **st})
+            if st.get("torch_compile_unsupported"):
+                stages[-1]["compile_s"] = "unsupported"
+        ph = r.get("timeline", {}).get("phases", {})
+        for sid, values in sorted(ph.items()):
+            if sid.startswith("stage"):
+                phases.append({"label": label, "stage": sid, **values})
         if "post_stages_wiring_s" in ph:
-            rows.append(
-                "| {} | wiring after last stage | | | | | {} |".format(
-                    b.get("label", r["log"]), ph["post_stages_wiring_s"]
-                )
-            )
-    return "\n".join(rows)
+            phases.append({"label": label, "stage": "after last stage", "total_s": ph["post_stages_wiring_s"]})
+    tables = [
+        (
+            {
+                "label": "label",
+                "imports": "imports (s)",
+                "engine_init": "engine ready (s)",
+                "first_request": "first request (s)",
+                "steady_request_avg": "subsequent avg (s)",
+                "time_to_first_image_from_process_start": "process→first image (s)",
+                "host_rss_peak_gib": "sampled host RSS (GiB)",
+                "gpu_used_peak_gib": "sampled GPU used (GiB)",
+            },
+            summary,
+        ),
+        (
+            {
+                "label": "label",
+                "stage": "stage",
+                "model_setup_estimate_s": "model setup estimate (s)",
+                "weights_load_s": "weights load (s)",
+                "compile_s": "compile (s)",
+                "graph_capture_s": "graph capture (s)",
+                "engine_init_s": "profile/KV/warmup reported (s)",
+            },
+            stages,
+        ),
+        (
+            {
+                "label": "label",
+                "stage": "stage",
+                "spawn_import_config_s": "spawn/import (s)",
+                "device_dist_init_s": "device init (s)",
+                "model_and_weights_load_s": "model+weights load (s)",
+                "profile_kv_warmup_s": "profile/KV/warmup interval (s)",
+                "total_s": "total (s)",
+            },
+            phases,
+        ),
+    ]
+    return "\n\n".join(warnings + [_table(columns, rows) for columns, rows in tables])
 
 
 def main() -> None:
@@ -254,8 +226,11 @@ def main() -> None:
     ap.add_argument("logs", nargs="+")
     ap.add_argument("--markdown", action="store_true")
     ap.add_argument("--json-out", default=None)
+    ap.add_argument("--require-complete", action="store_true", help="fail if any log has no BENCH_JSON")
     args = ap.parse_args()
     recs = [parse(p) for p in args.logs]
+    if args.require_complete and any(r["status"] != "complete" for r in recs):
+        ap.error("incomplete benchmark log: missing BENCH_JSON")
     if args.json_out:
         with open(args.json_out, "w") as f:
             json.dump(recs, f, indent=2)

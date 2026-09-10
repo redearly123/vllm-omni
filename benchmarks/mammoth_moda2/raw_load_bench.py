@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Raw safetensors -> GPU micro-benchmark, without vLLM's loader.
 
-Separates storage read, dtype conversion and host-to-device copy from any loader
-overhead, and compares where the fp32 -> bf16 cast runs:
+Compares CPU and GPU dtype conversion after materializing each mmap-backed tensor.
+Materialization includes page faults, CPU allocation and copying; it is not a disk
+bandwidth measurement. CUDA setup is excluded; transfer includes GPU allocation.
 
-  --mode cpu_cast         read -> cast to bf16 on the CPU -> copy to GPU   (what vLLM's loader does)
-  --mode gpu_cast         read -> copy fp32 to GPU -> cast on the GPU
-  --mode pinned_gpu_cast  read -> pin -> async copy fp32 to GPU -> cast on the GPU
+  --mode cpu_cast         materialize -> cast to bf16 on the CPU -> copy to GPU
+  --mode gpu_cast         materialize -> copy source dtype to GPU -> cast on the GPU
 
   python benchmarks/mammoth_moda2/raw_load_bench.py --model /path/MammothModa2-Preview --shards 6,7,8
   OMP_NUM_THREADS=4 python benchmarks/mammoth_moda2/raw_load_bench.py --model /path --shards 6,7,8 --mode cpu_cast
@@ -49,7 +49,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True)
     ap.add_argument("--shards", default="all", help="comma list of 1-based shard numbers, or 'all'")
-    ap.add_argument("--mode", choices=("cpu_cast", "gpu_cast", "pinned_gpu_cast"), default="cpu_cast")
+    ap.add_argument("--mode", choices=("cpu_cast", "gpu_cast"), default="cpu_cast")
     ap.add_argument("--label", default="raw")
     ap.add_argument("--no-cuda", action="store_true", help="read + CPU cast only (mode must be cpu_cast)")
     a = ap.parse_args()
@@ -59,16 +59,23 @@ def main() -> None:
     paths = shard_files(a.model, a.shards)
     total_bytes = sum(os.path.getsize(p) for p in paths)
 
+    if not a.no_cuda:
+        # Initialize the context and exercise both operations outside the timer.
+        warmup = torch.zeros(1).to("cuda")
+        warmup = warmup.to(torch.bfloat16)
+        sync()
+        del warmup
+
     t0 = time.perf_counter()
     n_tensors, cpu_bytes = 0, 0
     dtypes: dict[str, int] = {}
-    t_read = t_cast = t_h2d = 0.0
+    t_materialize = t_cast = t_h2d = 0.0
     for p in paths:
         with safe_open(p, framework="pt", device="cpu") as f:
             for k in f.keys():
                 r0 = time.perf_counter()
-                t = f.get_tensor(k)  # mmap -> materialize on CPU
-                t_read += time.perf_counter() - r0
+                t = f.get_tensor(k).clone()  # touch every page and own the CPU storage
+                t_materialize += time.perf_counter() - r0
                 dtypes[str(t.dtype)] = dtypes.get(str(t.dtype), 0) + 1
                 cpu_bytes += t.numel() * t.element_size()
                 needs_cast = t.is_floating_point() and t.dtype != torch.bfloat16
@@ -79,16 +86,13 @@ def main() -> None:
                     t_cast += time.perf_counter() - c0
                     if not a.no_cuda:
                         h0 = time.perf_counter()
-                        g = t.cuda()
+                        g = t.to("cuda")
                         sync()
                         t_h2d += time.perf_counter() - h0
                         del g
                 else:
                     h0 = time.perf_counter()
-                    if a.mode == "pinned_gpu_cast":
-                        g = t.pin_memory().cuda(non_blocking=True)
-                    else:
-                        g = t.cuda()
+                    g = t.to("cuda")
                     sync()
                     t_h2d += time.perf_counter() - h0
                     c0 = time.perf_counter()
@@ -110,12 +114,11 @@ def main() -> None:
         "dtypes": dtypes,
         "torch_threads": torch.get_num_threads(),
         "cpu_affinity": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
-        "read_s": round(t_read, 2),
-        "cast_s": round(t_cast, 2),
-        "h2d_s": round(t_h2d, 2),
-        "total_s": round(total, 2),
-        "read_gbps": round(total_bytes / 1e9 / max(t_read, 1e-9), 2),
-        "total_gbps": round(total_bytes / 1e9 / total, 2),
+        "materialize_s": round(t_materialize, 3),
+        "cast_s": round(t_cast, 3),
+        "h2d_s": round(t_h2d, 3),
+        "total_s": round(total, 3),
+        "cuda_setup_included": False,
     }
     print("RAWLOAD_JSON " + json.dumps(res))
 

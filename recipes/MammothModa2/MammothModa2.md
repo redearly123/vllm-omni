@@ -170,76 +170,14 @@ The first request took 85.224 seconds. The AR stage generated 4,161 visual token
 
 The output was a valid 1024 by 1024 RGB PNG.
 
-### 1x NVIDIA A800-SXM4-80GB, MammothModa2 Preview (startup breakdown)
+### Startup benchmark
 
-#### Environment
-
-- OS: Ubuntu 22.04 container, cgroup CPU quota of 16 CPUs on a 128-core host, local NVMe
-- Python: 3.12.14
-- PyTorch: 2.13.0+cu129
-- Driver / runtime: NVIDIA 580.126.09 / CUDA 12.9 wheels
-- GPU: one NVIDIA A800-SXM4-80GB
-- vLLM version: 0.28.0+cu129
-- vLLM Omni version or commit: `34aa1d2a`
-- Checkpoint: 34.52 GiB, 8 safetensors shards, 1010 of 1391 tensors stored in float32
-
-#### Offline Commands
-
-The committed deploy config (`gpu_memory_utilization` 0.5 / 0.3, eager) was
-used unchanged. Startup was measured with the benchmark under
-`benchmarks/mammoth_moda2/` (method, timing boundaries and the full tables are
-in its README):
-
-```bash
-python benchmarks/mammoth_moda2/bench_startup.py \
-    --model /path/MammothModa2-Preview --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
-    --height 1024 --width 1024 --seed 42 \
-    --extra-body '{"text_guidance_scale": 4.0, "cfg_range": [0.0, 1.0], "num_inference_steps": 50}' \
-    --repeat 3 --label baseline 2>&1 | tee baseline.log
-python benchmarks/mammoth_moda2/parse_startup_log.py baseline.log --markdown
-
-# thread count matched to the cgroup quota, stages initialized concurrently
-OMP_NUM_THREADS=16 python benchmarks/mammoth_moda2/bench_startup.py ... --parallel-stage-init
-```
-
-#### Verification
-
-Preview text-to-image, 1024×1024, 50 denoising steps, guidance 4.0, seed 42.
-Three requests in one process took 95.2 / 94.9 / 94.6 s (AR 77.9 s for 4,161
-visual tokens at 18.7 ms/token, DiT 17.1 s); there is no first-request
-overhead under eager execution. Output images are bit-identical across runs
-with the same seed.
-
-Time to ready (`Omni()` call to return, both stages loaded and warmed up;
-mean ± std of 3 independent processes; add ~10 s of Python imports):
-
-| configuration | time to ready | host RSS peak | GPU used peak |
-| --- | --- | --- | --- |
-| default (torch 64 threads on a 16-CPU quota), serial stage init | 61.0 ± 0.4 s | 12.8 GiB | 45.7 GiB |
-| `OMP_NUM_THREADS=16` | 57.3 ± 0.3 s | 12.4 GiB | 45.7 GiB |
-| `parallel_stage_init` | 42.1 ± 1.0 s | 15.7 GiB | 44.8 GiB |
-| `OMP_NUM_THREADS=16` + `parallel_stage_init` | **36.2 ± 0.3 s** | 15.3 GiB | 44.8 GiB |
-| default, page cache evicted | 80.8 ± 0.3 s | | |
-| default, FlashInfer JIT cache removed (first start on a machine) | 129.1 ± 0.2 s | | |
-| AR stage `enforce_eager: false` (CUDA graphs, serial init), caches warm / cold | 62.5 ± 0.1 s / 66.8 ± 0.9 s | | 45.8 GiB |
-
-Per stage in the default configuration, the AR stage spends 11 s in subprocess
-spawn and imports, 6 s in device initialization, 6 s loading weights and 5 s in
-profiling and warmup; the DiT stage 11 / 6 / 4 / 2 s; the orchestrator adds
-6 s after the last stage. The two stages initialize one after the other unless
-`parallel_stage_init` is set, which overlaps them without raising the GPU
-memory peak. Matching the thread count to the quota shortens the fp32→bf16
-conversion of the checkpoint; its effect grows with the oversubscription ratio
-(on a 4-CPU quota it halved time to ready). The first start on a machine pays
-~68 s of FlashInfer kernel JIT in the AR stage's warmup. With the AR stage's
-`enforce_eager` turned off (CUDA graphs; torch.compile is not supported by the
-model) capture adds 4 s to startup and cuts the 1024×1024 request from 95.2 to
-77.3 s (AR 77.9 → 60.0 s), at the cost of 13.5 GiB more non-KV memory in the
-AR stage: its KV cache shrinks from 15.7 to 2.0 GiB at the committed budget and
-`parallel_stage_init` no longer fits. Graph-mode output is deterministic but
-not bit-identical to eager (PSNR 25–31 dB). These numbers are the
-baseline for the startup/loading work tracked in
-[#7075](https://github.com/vllm-project/vllm-omni/issues/7075).
+The [startup benchmark](../../benchmarks/mammoth_moda2/README.md) provides
+commands, measurement boundaries and a single-A800 eager baseline. On that
+16-CPU-quota machine, parallel stage initialization and 16 CPU threads reduced
+`Omni()` initialization from about 60 s to 37 s. See the benchmark for the
+configuration and limitations; CUDA-graph mode needs separate memory and
+quality validation.
 
 ## MammothModa2-Dev unified inference
 

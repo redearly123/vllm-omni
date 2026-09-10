@@ -7,7 +7,7 @@ Measures, from a single fresh process:
   * Omni() construction wall time (all stages: weight load, profiling, KV cache, warmup)
   * first request latency (includes JIT / lazy init that only happens on first run)
   * steady-state request latency (repeat N-1 more requests)
-  * host RSS (this process tree) and GPU memory-in-use peaks, sampled once a second by the benchmark
+  * optional host RSS / device memory samples (--sample-memory, once a second)
 
 Per-stage breakdown (weight loading, model-load memory, engine init) is emitted by the
 stage engine-core subprocesses into the log; use parse_startup_log.py on the captured
@@ -67,13 +67,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--label", default="run", help="free-form label, e.g. nfs-cold / nfs-warm / local-nvme")
     p.add_argument("--output-json", default=None)
     p.add_argument("--save-image", default=None, help="optional path to save the first request's image")
-    p.add_argument("--enforce-eager", type=lambda s: s.lower() in ("1", "true", "yes"), default=None)
+    p.add_argument("--sample-memory", action="store_true", help="sample memory once a second (adds overhead)")
     p.add_argument(
         "--parallel-stage-init",
         action="store_true",
         help="initialize stages that share a GPU concurrently (VllmOmniOrchestratorConfig.parallel_stage_init)",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.repeat < 1:
+        p.error("--repeat must be at least 1")
+    return args
 
 
 def gpu_info() -> dict:
@@ -234,6 +237,9 @@ def main() -> None:
     result = {
         "label": args.label,
         "model": args.model,
+        "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt,
+        "sample_memory": args.sample_memory,
         "model_fs": fs_type(args.model),
         "deploy_config": args.deploy_config,
         "height": args.height,
@@ -250,77 +256,82 @@ def main() -> None:
     omni_kwargs = {"model": args.model, "mode": "text-to-image", "log_stats": True}
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
-    if args.enforce_eager is not None:
-        omni_kwargs["enforce_eager"] = args.enforce_eager
     if args.parallel_stage_init:
         omni_kwargs["parallel_stage_init"] = True
 
-    sampler = PeakSampler().start()
+    sampler = PeakSampler().start() if args.sample_memory else None
     t0 = time.perf_counter()
-    omni = Omni(**omni_kwargs)
-    t1 = time.perf_counter()
-    result["peak_mem_startup"] = sampler.stop()
-    result["phases_s"]["engine_init"] = round(t1 - t0, 3)
-    result["phases_s"]["process_to_engine_ready"] = round(t1 - T_PROCESS_START, 3)
-    print(
-        f"BENCH engine_init={t1 - t0:.2f}s process_to_engine_ready={t1 - T_PROCESS_START:.2f}s "
-        f"peak_mem_startup={result['peak_mem_startup']}",
-        flush=True,
-    )
-    sampler = PeakSampler().start()
+    omni = None
+    try:
+        omni = Omni(**omni_kwargs)
+        t1 = time.perf_counter()
+        result["peak_mem_startup"] = sampler.stop() if sampler else {}
+        sampler = None
+        result["phases_s"]["engine_init"] = round(t1 - t0, 3)
+        result["phases_s"]["process_to_engine_ready"] = round(t1 - T_PROCESS_START, 3)
+        print(
+            f"BENCH engine_init={t1 - t0:.2f}s process_to_engine_ready={t1 - T_PROCESS_START:.2f}s "
+            f"peak_mem_startup={result['peak_mem_startup']}",
+            flush=True,
+        )
+        sampler = PeakSampler().start() if args.sample_memory else None
 
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
-    outputs = None
-    first_outputs = None
-    for i in range(max(1, args.repeat)):
-        prompt_dict, sampling_params_list = build_request(omni, args, generator)
-        tr0 = time.perf_counter()
-        outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
-        tr1 = time.perf_counter()
-        if first_outputs is None:
-            first_outputs = outputs
-        rec = {
-            "index": i,
-            "kind": "first" if i == 0 else "steady",
-            "latency_s": round(tr1 - tr0, 3),
-            "stages": stage_metrics(outputs),
+        generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+        outputs = None
+        first_outputs = None
+        first_image_elapsed = 0.0
+        for i in range(args.repeat):
+            prompt_dict, sampling_params_list = build_request(omni, args, generator)
+            tr0 = time.perf_counter()
+            outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
+            tr1 = time.perf_counter()
+            if first_outputs is None:
+                first_outputs = outputs
+                first_image_elapsed = tr1 - T_PROCESS_START
+            rec = {
+                "index": i,
+                "kind": "first" if i == 0 else "steady",
+                "latency_s": round(tr1 - tr0, 3),
+                "stages": stage_metrics(outputs),
+            }
+            result["requests"].append(rec)
+            print(f"BENCH request[{i}] {rec['kind']} latency={tr1 - tr0:.2f}s stages={rec['stages']}", flush=True)
+
+        result["peak_mem_requests"] = sampler.stop() if sampler else {}
+        sampler = None
+        steady = [r["latency_s"] for r in result["requests"] if r["kind"] == "steady"]
+        result["summary_s"] = {
+            "imports": result["phases_s"]["imports"],
+            "engine_init": result["phases_s"]["engine_init"],
+            "first_request": result["requests"][0]["latency_s"],
+            "steady_request_avg": round(sum(steady) / len(steady), 3) if steady else None,
+            "time_to_first_image_from_process_start": round(first_image_elapsed, 3),
         }
-        result["requests"].append(rec)
-        print(f"BENCH request[{i}] {rec['kind']} latency={tr1 - tr0:.2f}s stages={rec['stages']}", flush=True)
 
-    result["peak_mem_requests"] = sampler.stop()
-    steady = [r["latency_s"] for r in result["requests"] if r["kind"] == "steady"]
-    result["summary_s"] = {
-        "imports": result["phases_s"]["imports"],
-        "engine_init": result["phases_s"]["engine_init"],
-        "first_request": result["requests"][0]["latency_s"],
-        "steady_request_avg": round(sum(steady) / len(steady), 3) if steady else None,
-        "host_rss_peak_gib": max(
-            result["peak_mem_startup"]["host_rss_peak_gib"], result["peak_mem_requests"]["host_rss_peak_gib"]
-        ),
-        "gpu_used_peak_gib": max(
-            result["peak_mem_startup"]["gpu_used_peak_gib"], result["peak_mem_requests"]["gpu_used_peak_gib"]
-        ),
-        "time_to_first_image_from_process_start": round(
-            result["phases_s"]["process_to_engine_ready"] + result["requests"][0]["latency_s"], 3
-        ),
-    }
+        for key in ("host_rss_peak_gib", "gpu_used_peak_gib"):
+            result["summary_s"][key] = (
+                max(result["peak_mem_startup"][key], result["peak_mem_requests"][key]) if args.sample_memory else None
+            )
 
-    if args.save_image and first_outputs:
         from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
 
-        # Save the FIRST request's image: the shared torch.Generator advances between
-        # requests, so only request[0] is comparable across runs with the same seed.
         images = extract_images_from_outputs(first_outputs)
-        if images:
+        if not images:
+            raise RuntimeError("First request returned no image")
+        if args.save_image:
             os.makedirs(os.path.dirname(os.path.abspath(args.save_image)), exist_ok=True)
             images[0].save(args.save_image)
 
-    print("BENCH_JSON " + json.dumps(result), flush=True)
-    if args.output_json:
-        with open(args.output_json, "w") as f:
-            json.dump(result, f, indent=2)
-        print(f"BENCH wrote {args.output_json}", flush=True)
+        print("BENCH_JSON " + json.dumps(result), flush=True)
+        if args.output_json:
+            with open(args.output_json, "w") as f:
+                json.dump(result, f, indent=2)
+            print(f"BENCH wrote {args.output_json}", flush=True)
+    finally:
+        if sampler:
+            sampler.stop()
+        if omni is not None:
+            omni.close()
 
 
 if __name__ == "__main__":
